@@ -1,6 +1,5 @@
 require('dotenv').config();
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const nodemailer = require('nodemailer');
 
@@ -16,41 +15,120 @@ console.log('=== Environment Check ===');
 console.log('PORT:', PORT);
 console.log('GMAIL_USER:', process.env.GMAIL_USER ? '✓ Set' : '✗ NOT SET');
 console.log('GMAIL_APP_PASSWORD:', process.env.GMAIL_APP_PASSWORD ? '✓ Set' : '✗ NOT SET');
+console.log('TURSO_DATABASE_URL:', process.env.TURSO_DATABASE_URL ? '✓ Set' : '✗ NOT SET (using local SQLite)');
 console.log('=========================');
 
-// Database Setup - Use /tmp for Render compatibility
-const isProduction = process.env.NODE_ENV === 'production' || process.env.RENDER;
-const dbPath = isProduction
-    ? '/tmp/zootechx.db'  // Render's writable directory
-    : path.join(__dirname, 'zootechx.db');
+// Database Setup - Use Turso if configured, otherwise local SQLite
+let db;
+let useTurso = false;
 
-console.log('Database path:', dbPath);
+async function initDatabase() {
+    if (process.env.TURSO_DATABASE_URL && process.env.TURSO_AUTH_TOKEN) {
+        // Use Turso Cloud Database
+        console.log('🌐 Using Turso Cloud Database...');
+        const { createClient } = require('@libsql/client');
+        db = createClient({
+            url: process.env.TURSO_DATABASE_URL,
+            authToken: process.env.TURSO_AUTH_TOKEN,
+        });
+        useTurso = true;
 
-const db = new sqlite3.Database(dbPath, (err) => {
-    if (err) {
-        console.error('Error opening database', err.message);
-    } else {
-        console.log('Connected to the SQLite database at:', dbPath);
-        createTable();
-    }
-});
-
-function createTable() {
-    db.run(`CREATE TABLE IF NOT EXISTS spins (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        email TEXT UNIQUE,
-        domain TEXT,
-        discount INTEGER,
-        couponCode TEXT,
-        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`, (err) => {
-        if (err) {
-            console.error('Error creating table:', err.message);
-        } else {
-            console.log('Spins table ready.');
+        // Create table in Turso
+        try {
+            await db.execute(`CREATE TABLE IF NOT EXISTS spins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                email TEXT UNIQUE,
+                domain TEXT,
+                discount INTEGER,
+                couponCode TEXT,
+                createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`);
+            console.log('✅ Turso database table ready.');
+        } catch (err) {
+            console.error('Turso table creation error:', err.message);
         }
-    });
+    } else {
+        // Use local SQLite
+        console.log('💾 Using local SQLite database...');
+        const sqlite3 = require('sqlite3').verbose();
+        const isProduction = process.env.NODE_ENV === 'production' || process.env.RENDER;
+        const dbPath = isProduction
+            ? '/tmp/zootechx.db'
+            : path.join(__dirname, 'zootechx.db');
+
+        console.log('Database path:', dbPath);
+
+        db = new sqlite3.Database(dbPath, (err) => {
+            if (err) {
+                console.error('Error opening database', err.message);
+            } else {
+                console.log('✅ Connected to SQLite database.');
+                db.run(`CREATE TABLE IF NOT EXISTS spins (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT,
+                    email TEXT UNIQUE,
+                    domain TEXT,
+                    discount INTEGER,
+                    couponCode TEXT,
+                    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+                )`);
+            }
+        });
+    }
+}
+
+// Database helper functions
+async function checkEmailExists(email) {
+    if (useTurso) {
+        const result = await db.execute({
+            sql: "SELECT * FROM spins WHERE email = ?",
+            args: [email]
+        });
+        return result.rows.length > 0 ? result.rows[0] : null;
+    } else {
+        return new Promise((resolve, reject) => {
+            db.get("SELECT * FROM spins WHERE email = ?", [email], (err, row) => {
+                if (err) reject(err);
+                else resolve(row);
+            });
+        });
+    }
+}
+
+async function insertSpin(name, email, domain, discount, couponCode) {
+    if (useTurso) {
+        await db.execute({
+            sql: "INSERT INTO spins (name, email, domain, discount, couponCode) VALUES (?, ?, ?, ?, ?)",
+            args: [name, email, domain, discount, couponCode]
+        });
+        return true;
+    } else {
+        return new Promise((resolve, reject) => {
+            db.run(
+                "INSERT INTO spins (name, email, domain, discount, couponCode) VALUES (?, ?, ?, ?, ?)",
+                [name, email, domain, discount, couponCode],
+                function (err) {
+                    if (err) reject(err);
+                    else resolve(this.lastID);
+                }
+            );
+        });
+    }
+}
+
+async function getAllSpins() {
+    if (useTurso) {
+        const result = await db.execute("SELECT * FROM spins ORDER BY createdAt DESC");
+        return result.rows;
+    } else {
+        return new Promise((resolve, reject) => {
+            db.all("SELECT * FROM spins ORDER BY createdAt DESC", [], (err, rows) => {
+                if (err) reject(err);
+                else resolve(rows);
+            });
+        });
+    }
 }
 
 // Email Sending Logic with better error handling
@@ -116,7 +194,7 @@ async function sendCouponEmail(name, email, domain, discount, couponCode) {
     }
 }
 
-// Health check endpoint - useful for debugging on Render
+// Health check endpoint
 app.get('/api/health', (req, res) => {
     const health = {
         status: 'OK',
@@ -125,26 +203,25 @@ app.get('/api/health', (req, res) => {
             port: PORT,
             gmailUser: process.env.GMAIL_USER ? 'configured' : 'NOT SET',
             gmailPassword: process.env.GMAIL_APP_PASSWORD ? 'configured' : 'NOT SET',
-            nodeEnv: process.env.NODE_ENV || 'development',
-            isRender: !!process.env.RENDER
-        },
-        database: dbPath
+            database: useTurso ? 'Turso Cloud' : 'Local SQLite',
+            tursoUrl: process.env.TURSO_DATABASE_URL ? 'configured' : 'NOT SET'
+        }
     };
     res.json(health);
 });
 
-// Get all spins (for debugging)
-app.get('/api/spins', (req, res) => {
-    db.all("SELECT id, name, email, domain, discount, couponCode, createdAt FROM spins ORDER BY createdAt DESC", [], (err, rows) => {
-        if (err) {
-            return res.status(500).json({ error: err.message });
-        }
-        res.json({ count: rows.length, spins: rows });
-    });
+// Get all spins
+app.get('/api/spins', async (req, res) => {
+    try {
+        const spins = await getAllSpins();
+        res.json({ count: spins.length, spins });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // API Endpoint
-app.post('/api/spin', (req, res) => {
+app.post('/api/spin', async (req, res) => {
     const { name, email, domain, discount, couponCode } = req.body;
 
     console.log(`\n=== New Spin Request ===`);
@@ -154,7 +231,6 @@ app.post('/api/spin', (req, res) => {
         return res.status(400).json({ allowed: false, message: "Name and Email are required." });
     }
 
-    // Basic email validation
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email)) {
         return res.status(400).json({ allowed: false, message: "Please enter a valid email address." });
@@ -162,38 +238,37 @@ app.post('/api/spin', (req, res) => {
 
     const normalizedEmail = email.toLowerCase().trim();
 
-    // Check if email already exists
-    db.get("SELECT * FROM spins WHERE email = ?", [normalizedEmail], (err, row) => {
-        if (err) {
-            console.error('Database query error:', err.message);
-            return res.status(500).json({ allowed: false, message: "Database Error" });
-        }
+    try {
+        // Check if email already exists
+        const existingRow = await checkEmailExists(normalizedEmail);
 
-        if (row) {
+        if (existingRow) {
             console.log(`❌ Email ${normalizedEmail} already used.`);
             return res.json({ allowed: false, message: "You have already spun the wheel with this email address." });
         }
 
         // Save new spin
-        const stmt = db.prepare("INSERT INTO spins (name, email, domain, discount, couponCode) VALUES (?, ?, ?, ?, ?)");
-        stmt.run(name, normalizedEmail, domain, discount, couponCode, function (err) {
-            if (err) {
-                console.error('Database insert error:', err.message);
-                return res.status(500).json({ allowed: false, message: "Database Save Error" });
-            }
+        await insertSpin(name, normalizedEmail, domain, discount, couponCode);
+        console.log(`✅ Spin saved for ${normalizedEmail}`);
 
-            console.log(`✅ Spin saved for ${normalizedEmail} (ID: ${this.lastID})`);
+        // Send Email (Fire and forget)
+        sendCouponEmail(name, email, domain, discount, couponCode);
 
-            // Send Email (Fire and forget to avoid blocking response)
-            sendCouponEmail(name, email, domain, discount, couponCode);
-
-            res.json({ allowed: true, success: true });
-        });
-        stmt.finalize();
-    });
+        res.json({ allowed: true, success: true });
+    } catch (err) {
+        console.error('Database error:', err.message);
+        res.status(500).json({ allowed: false, message: "Database Error: " + err.message });
+    }
 });
 
-app.listen(PORT, () => {
-    console.log(`\n🚀 Server running on http://localhost:${PORT}`);
-    console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+// Initialize database and start server
+initDatabase().then(() => {
+    app.listen(PORT, () => {
+        console.log(`\n🚀 Server running on http://localhost:${PORT}`);
+        console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+        console.log(`📋 View spins: http://localhost:${PORT}/api/spins`);
+    });
+}).catch(err => {
+    console.error('Failed to initialize database:', err);
+    process.exit(1);
 });
