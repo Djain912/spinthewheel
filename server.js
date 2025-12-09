@@ -150,10 +150,15 @@ async function sendCouponEmail(name, email, domain, discount, couponCode) {
     console.log(`📧 Sending email from: ${process.env.GMAIL_USER}`);
 
     const transporter = nodemailer.createTransport({
-        service: 'gmail',
+        host: "smtp.gmail.com",
+        port: 465,
+        secure: true,
         auth: {
             user: process.env.GMAIL_USER,
-            pass: process.env.GMAIL_APP_PASSWORD
+            pass: process.env.GMAIL_APP_PASSWORD,
+        },
+        tls: {
+            rejectUnauthorized: false,
         }
     });
 
