@@ -152,7 +152,7 @@ async function sendCouponEmail(name, email, domain, discount, couponCode) {
     const transporter = nodemailer.createTransport({
         host: "smtp.gmail.com",
         port: 587,
-        secure: false, // true for 465, false for other ports
+        secure: false,
         auth: {
             user: process.env.GMAIL_USER,
             pass: process.env.GMAIL_APP_PASSWORD,
@@ -160,9 +160,11 @@ async function sendCouponEmail(name, email, domain, discount, couponCode) {
         tls: {
             rejectUnauthorized: false
         },
-        // Add specific timeouts
-        connectionTimeout: 10000,
-        greetingTimeout: 10000
+        // Force IPv4 to avoid IPv6 connectivity issues
+        family: 4,
+        // Increase timeouts
+        connectionTimeout: 30000,
+        greetingTimeout: 30000
     });
 
     const mailOptions = {
