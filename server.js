@@ -151,15 +151,18 @@ async function sendCouponEmail(name, email, domain, discount, couponCode) {
 
     const transporter = nodemailer.createTransport({
         host: "smtp.gmail.com",
-        port: 465,
-        secure: true,
+        port: 587,
+        secure: false, // true for 465, false for other ports
         auth: {
             user: process.env.GMAIL_USER,
             pass: process.env.GMAIL_APP_PASSWORD,
         },
         tls: {
-            rejectUnauthorized: false,
-        }
+            rejectUnauthorized: false
+        },
+        // Add specific timeouts
+        connectionTimeout: 10000,
+        greetingTimeout: 10000
     });
 
     const mailOptions = {
